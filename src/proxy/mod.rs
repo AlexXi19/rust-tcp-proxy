@@ -1,7 +1,8 @@
 pub mod crypto;
+pub mod protocol;
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use self::crypto::{decrypt, encrypt, identity};
@@ -11,6 +12,12 @@ pub enum ProxyMode {
     Client,
     Server,
     Proxy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChannelType {
+    Receiving,
+    Sending,
 }
 
 pub async fn start_proxy(
@@ -33,22 +40,45 @@ pub async fn start_proxy(
 }
 
 async fn transfer_data(
+    proxy_mode: ProxyMode,
+    channel_type: ChannelType,
     mut read_stream: impl tokio::io::AsyncRead + Unpin,
     mut write_stream: impl AsyncWrite + Unpin,
     process_data: CryptoFn,
 ) -> Result<()> {
-    let mut buf = vec![0; 1_000_000];
     loop {
-        let n = read_stream.read(&mut buf).await?;
-        if n == 0 {
+        let content = match (proxy_mode.clone(), channel_type.clone()) {
+            (ProxyMode::Client, ChannelType::Sending)
+            | (ProxyMode::Server, ChannelType::Receiving) => {
+                protocol::custom_read_protocol(&mut read_stream, process_data).await?
+            }
+            _ => {
+                let content =
+                    protocol::standard_read_protocol(&mut read_stream, process_data).await?;
+                if content.is_empty() {
+                    // Tell server that client has no more data to send
+                    let empty_byte: [u8; 2] = [0, 0];
+                    write_stream.write_all(&empty_byte).await?;
+                }
+
+                content
+            }
+        };
+
+        if content.is_empty() {
+            write_stream.shutdown().await?;
             break;
         }
-        let content = &buf[0..n];
-        let processed_content = process_data(content.to_vec())?;
-        write_stream.write_all(&processed_content).await?;
+
+        match (proxy_mode.clone(), channel_type.clone()) {
+            (ProxyMode::Client, ChannelType::Receiving)
+            | (ProxyMode::Server, ChannelType::Sending) => {
+                protocol::custom_write_protocol(content, &mut write_stream).await?
+            }
+            _ => protocol::standard_write_protocol(content, &mut write_stream).await?,
+        }
     }
 
-    write_stream.shutdown().await?;
     Ok(())
 }
 
@@ -70,9 +100,22 @@ async fn forward_to_server(
         ProxyMode::Proxy => (identity, identity),
     };
 
-    let client_to_server = transfer_data(rc, ws, inbound_fn);
-    let server_to_client = transfer_data(rs, wc, outbound_fn);
+    let client_to_server = transfer_data(
+        proxy_mode.clone(),
+        ChannelType::Receiving,
+        rc,
+        ws,
+        inbound_fn,
+    );
+    let server_to_client = transfer_data(
+        proxy_mode.clone(),
+        ChannelType::Sending,
+        rs,
+        wc,
+        outbound_fn,
+    );
 
+    // await and log each error
     tokio::try_join!(client_to_server, server_to_client)?;
 
     Ok(())
