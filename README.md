@@ -1,5 +1,7 @@
 # TCP Proxy
 
+https://notes.alexxi.dev/Weekend-Projects/Building-a-secure-TCP-Forwarder
+
 This secure TCP Proxy listens to traffic on one address and forwards it to another address and was designed to encrypt tcp traffic between a client and a server for secured communication. 
 
 ### Features
